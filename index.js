@@ -3,7 +3,7 @@
 //
 // Adapted from https://github.com/obezuk/worker-signed-s3-template
 //
-import { AwsClient } from 'aws4fetch'
+import { AwsClient } from './aws4fetch.js'
 
 const UNSIGNABLE_HEADERS = [
     // These headers appear in the request, but are never passed upstream
@@ -28,6 +28,104 @@ const HTTPS_PORT = "443";
 
 // How many times to retry a range request where the response is missing content-range
 const RANGE_RETRY_ATTEMPTS = 3;
+
+function uriEncode(value) {
+    return encodeURIComponent(value).replace(/[!'()*]/g, (char) => `%${char.charCodeAt(0).toString(16).toUpperCase()}`);
+}
+
+function canonicalUri(pathname) {
+    if (!pathname || pathname === "/") return "/";
+    return pathname.split("/").map((segment) => {
+        try {
+            return uriEncode(decodeURIComponent(segment));
+        } catch {
+            return uriEncode(segment);
+        }
+    }).join("/");
+}
+
+function canonicalQuery(url) {
+    const pairs = [];
+    for (const [key, value] of url.searchParams.entries()) {
+        if (key.toLowerCase() === "x-amz-signature") continue;
+        pairs.push([uriEncode(key), uriEncode(value)]);
+    }
+    pairs.sort((left, right) => (left[0] === right[0] ? (left[1] < right[1] ? -1 : left[1] > right[1] ? 1 : 0) : left[0] < right[0] ? -1 : 1));
+    return pairs.map(([key, value]) => `${key}=${value}`).join("&");
+}
+
+async function hmac(keyBytes, data) {
+    const key = await crypto.subtle.importKey("raw", keyBytes, { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+    return new Uint8Array(await crypto.subtle.sign("HMAC", key, typeof data === "string" ? new TextEncoder().encode(data) : data));
+}
+
+function hex(bytes) {
+    return [...bytes].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+function safeEqual(left, right) {
+    if (left.length !== right.length) return false;
+    let mismatch = 0;
+    for (let index = 0; index < left.length; index += 1) mismatch |= left.charCodeAt(index) ^ right.charCodeAt(index);
+    return mismatch === 0;
+}
+
+// Alist signs the custom host. B2 would reject that Host, so check it here, then the caller re-signs upstream.
+async function verifyIncomingPresign(url, request, env) {
+    const algorithm = url.searchParams.get("X-Amz-Algorithm");
+    const credential = url.searchParams.get("X-Amz-Credential") || "";
+    const amzDate = url.searchParams.get("X-Amz-Date") || "";
+    const signature = (url.searchParams.get("X-Amz-Signature") || "").toLowerCase();
+    const signedHeaders = (url.searchParams.get("X-Amz-SignedHeaders") || "").toLowerCase();
+    const expires = Number(url.searchParams.get("X-Amz-Expires"));
+    const parts = credential.split("/");
+    if (algorithm !== "AWS4-HMAC-SHA256" || parts.length !== 5 || !signature || !signedHeaders) return "credential";
+    const [accessKey, dateStamp, region, service, terminator] = parts;
+    if (accessKey !== env.B2_APPLICATION_KEY_ID || service !== "s3" || terminator !== "aws4_request") return "credential";
+    if (env.B2_REGION && region !== env.B2_REGION) return "region";
+    if (!amzDate.startsWith(dateStamp) || amzDate.length < 16) return "date";
+    const maxAge = Number(env.SIGN_URL_EXPIRE_SECONDS || 0);
+    if (!Number.isFinite(expires) || expires <= 0) return "expires";
+    if (maxAge > 0 && expires > maxAge + 60) return "expires";
+    const issued = Date.UTC(
+        Number(amzDate.slice(0, 4)),
+        Number(amzDate.slice(4, 6)) - 1,
+        Number(amzDate.slice(6, 8)),
+        Number(amzDate.slice(9, 11)),
+        Number(amzDate.slice(11, 13)),
+        Number(amzDate.slice(13, 15)),
+    );
+    const now = Date.now();
+    if (Number.isNaN(issued) || now > issued + expires * 1000 + 60000 || now + 60000 < issued) return "expired";
+
+    const names = signedHeaders.split(";");
+    let canonicalHeaders = "";
+    for (const name of names) {
+        let value = name === "host" ? request.headers.get("host") || url.host : request.headers.get(name) || "";
+        value = value.trim().replace(/\s+/g, " ");
+        if (!value) return "headers";
+        canonicalHeaders += `${name}:${value}\n`;
+    }
+    const payload = names.includes("x-amz-content-sha256")
+        ? request.headers.get("x-amz-content-sha256") || url.searchParams.get("X-Amz-Content-Sha256") || "UNSIGNED-PAYLOAD"
+        : "UNSIGNED-PAYLOAD";
+    const canonical = [
+        request.method,
+        canonicalUri(url.pathname),
+        canonicalQuery(url),
+        canonicalHeaders,
+        signedHeaders,
+        payload,
+    ].join("\n");
+    const canonicalHash = hex(new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(canonical))));
+    const scope = `${dateStamp}/${region}/${service}/${terminator}`;
+    const stringToSign = `AWS4-HMAC-SHA256\n${amzDate}\n${scope}\n${canonicalHash}`;
+    const secret = new TextEncoder().encode(`AWS4${env.B2_APPLICATION_KEY}`);
+    const signingKey = await hmac(await hmac(await hmac(await hmac(secret, dateStamp), region), service), "aws4_request");
+    const expected = hex(await hmac(signingKey, stringToSign));
+    return safeEqual(expected, signature) ? "" : "signature";
+}
+
 
 // Filter out cf-* and any other headers we don't want to include in the signature
 function filterHeaders(headers, env) {
@@ -70,6 +168,16 @@ export default {
         }
 
         const url = new URL(request.url);
+        const presignRequired = Number(env["SIGN_URL_EXPIRE_SECONDS"] || 0) > 0;
+        if (presignRequired || url.searchParams.has("X-Amz-Signature")) {
+            const presignError = await verifyIncomingPresign(url, request, env);
+            if (presignError) {
+                return new Response(presignError, { status: 403, statusText: "Forbidden" });
+            }
+            for (const key of [...url.searchParams.keys()]) {
+                if (key.toLowerCase().startsWith("x-amz-")) url.searchParams.delete(key);
+            }
+        }
 
         // Incoming protocol and port is taken from the worker's environment.
         // Local dev mode uses plain http on 8787, and it's possible to deploy
@@ -114,6 +222,10 @@ export default {
         // are removed from the outgoing request. If they are in the outgoing
         // signed headers, B2 can't validate the signature.
         const headers = filterHeaders(request.headers, env);
+        headers.delete("authorization");
+        for (const key of [...headers.keys()]) {
+            if (key.toLowerCase().startsWith("x-amz-")) headers.delete(key);
+        }
 
         // Create an S3 API client that can sign the outgoing request
         const client = new AwsClient({
@@ -206,3 +318,6 @@ export default {
         return fetchPromise;
     },
 };
+
+
+
