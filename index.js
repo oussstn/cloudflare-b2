@@ -3,7 +3,7 @@
 //
 // Adapted from https://github.com/obezuk/worker-signed-s3-template
 //
-import { AwsClient } from './aws4fetch.js'
+import { AwsClient } from 'aws4fetch'
 
 const UNSIGNABLE_HEADERS = [
     // These headers appear in the request, but are never passed upstream
@@ -81,12 +81,10 @@ async function verifyIncomingPresign(url, request, env) {
     const parts = credential.split("/");
     if (algorithm !== "AWS4-HMAC-SHA256" || parts.length !== 5 || !signature || !signedHeaders) return "credential";
     const [accessKey, dateStamp, region, service, terminator] = parts;
+    // Alist puts its own region (usually "alist") in X-Amz-Credential. Do not compare it to the B2 region.
     if (accessKey !== env.B2_APPLICATION_KEY_ID || service !== "s3" || terminator !== "aws4_request") return "credential";
-    if (env.B2_REGION && region !== env.B2_REGION) return "region";
     if (!amzDate.startsWith(dateStamp) || amzDate.length < 16) return "date";
-    const maxAge = Number(env.SIGN_URL_EXPIRE_SECONDS || 0);
     if (!Number.isFinite(expires) || expires <= 0) return "expires";
-    if (maxAge > 0 && expires > maxAge + 60) return "expires";
     const issued = Date.UTC(
         Number(amzDate.slice(0, 4)),
         Number(amzDate.slice(4, 6)) - 1,
@@ -168,15 +166,15 @@ export default {
         }
 
         const url = new URL(request.url);
-        const presignRequired = Number(env["SIGN_URL_EXPIRE_SECONDS"] || 0) > 0;
-        if (presignRequired || url.searchParams.has("X-Amz-Signature")) {
-            const presignError = await verifyIncomingPresign(url, request, env);
-            if (presignError) {
-                return new Response(presignError, { status: 403, statusText: "Forbidden" });
-            }
-            for (const key of [...url.searchParams.keys()]) {
-                if (key.toLowerCase().startsWith("x-amz-")) url.searchParams.delete(key);
-            }
+        if (!url.searchParams.has("X-Amz-Signature")) {
+            return new Response("unauthorized", { status: 401, statusText: "Unauthorized" });
+        }
+        const presignError = await verifyIncomingPresign(url, request, env);
+        if (presignError) {
+            return new Response(presignError, { status: 403, statusText: "Forbidden" });
+        }
+        for (const key of [...url.searchParams.keys()]) {
+            if (key.toLowerCase().startsWith("x-amz-")) url.searchParams.delete(key);
         }
 
         // Incoming protocol and port is taken from the worker's environment.
