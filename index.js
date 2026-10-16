@@ -81,8 +81,9 @@ async function verifyIncomingPresign(url, request, env) {
     const parts = credential.split("/");
     if (algorithm !== "AWS4-HMAC-SHA256" || parts.length !== 5 || !signature || !signedHeaders) return "credential";
     const [accessKey, dateStamp, region, service, terminator] = parts;
-    // Alist puts its own region (usually "alist") in X-Amz-Credential. Do not compare it to the B2 region.
-    if (accessKey !== env.B2_APPLICATION_KEY_ID || service !== "s3" || terminator !== "aws4_request") return "credential";
+    // Dashboard/wrangler values often include a trailing newline. Alist's region (usually "alist") is not the B2 region.
+    const keyId = String(env.B2_APPLICATION_KEY_ID || "").trim().replace(/^["']|["']$/g, "");
+    if (accessKey !== keyId || service !== "s3" || terminator !== "aws4_request") return "credential";
     if (!amzDate.startsWith(dateStamp) || amzDate.length < 16) return "date";
     if (!Number.isFinite(expires) || expires <= 0) return "expires";
     const issued = Date.UTC(
@@ -118,7 +119,7 @@ async function verifyIncomingPresign(url, request, env) {
     const canonicalHash = hex(new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(canonical))));
     const scope = `${dateStamp}/${region}/${service}/${terminator}`;
     const stringToSign = `AWS4-HMAC-SHA256\n${amzDate}\n${scope}\n${canonicalHash}`;
-    const secret = new TextEncoder().encode(`AWS4${env.B2_APPLICATION_KEY}`);
+    const secret = new TextEncoder().encode(`AWS4${String(env.B2_APPLICATION_KEY || "").trim().replace(/^["']|["']$/g, "")}`);
     const signingKey = await hmac(await hmac(await hmac(await hmac(secret, dateStamp), region), service), "aws4_request");
     const expected = hex(await hmac(signingKey, stringToSign));
     return safeEqual(expected, signature) ? "" : "signature";
